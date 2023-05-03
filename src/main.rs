@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod config;
-mod state;
 mod hooks;
+mod state;
 mod tasks;
 mod tls;
 mod util;
@@ -75,81 +75,34 @@ async fn main() -> Result<()> {
         None => return Ok(()),
     };
 
-    let bind_port = match plugin.option("grpc-hodl-port") {
-        Some(options::Value::Integer(-1)) => {
-            log::info!("`grpc-hodl-port` option is not configured, exiting.");
-            plugin
-                .disable("`grpc-hodl-port` option is not configured.")
-                .await?;
-            return Ok(());
-        }
-        Some(options::Value::Integer(i)) => i,
-        None => return Err(anyhow!("Missing 'grpc-hodl-port' option")),
-        Some(o) => return Err(anyhow!("grpc-hodl-port is not a valid integer: {:?}", o)),
-    };
-    let confplugin;
     match plugin.start(state.clone()).await {
         Ok(p) => {
             info!("starting lookup_state task");
-            confplugin = p;
-            let lookupclone = confplugin.clone();
+            let lookup_state = p.clone();
             tokio::spawn(async move {
-                match tasks::lookup_state(lookupclone).await {
+                match tasks::lookup_state(lookup_state.clone()).await {
                     Ok(()) => (),
                     Err(e) => warn!("Error in lookup_state thread: {}", e.to_string()),
                 };
             });
-            let cleanupclone = confplugin.clone();
+            let cleanup_state = p.clone();
             tokio::spawn(async move {
-                match tasks::clean_up(cleanupclone).await {
+                match tasks::clean_up(cleanup_state.clone()).await {
                     Ok(()) => (),
                     Err(e) => warn!("Error in clean_up thread: {}", e.to_string()),
                 };
             });
+            let plugin_state = p.clone();
+            tokio::select! {
+                _ = plugin_state.join() => {
+                // This will likely never be shown, if we got here our
+                // parent process is exiting and not processing out log
+                // messages anymore.
+                    debug!("Plugin loop terminated")
+                }
+            }
+            Ok(())
         }
         Err(e) => return Err(anyhow!("Error starting plugin: {}", e)),
     }
-
-    let bind_addr: SocketAddr = format!("0.0.0.0:{}", bind_port).parse().unwrap();
-
-    tokio::select! {
-        _ = confplugin.join() => {
-        // This will likely never be shown, if we got here our
-        // parent process is exiting and not processing out log
-        // messages anymore.
-            debug!("Plugin loop terminated")
-        }
-        e = run_interface(bind_addr, state) => {
-            warn!("Error running grpc interface: {:?}", e)
-        }
-    }
-    Ok(())
-}
-
-async fn run_interface(bind_addr: SocketAddr, state: PluginState) -> Result<()> {
-    let identity = state.identity.to_tonic_identity();
-    let ca_cert = tonic::transport::Certificate::from_pem(state.ca_cert);
-
-    let tls = tonic::transport::ServerTlsConfig::new()
-        .identity(identity)
-        .client_ca_root(ca_cert);
-
-    let server = tonic::transport::Server::builder()
-        .tls_config(tls)
-        .context("configuring tls")?
-        .add_service(NodeServer::new(
-            cln_grpc::Server::new(&state.rpc_path)
-                .await
-                .context("creating NodeServer instance")?,
-        ))
-        .serve(bind_addr);
-
-    debug!(
-        "Connecting to {:?} and serving grpc on {:?}",
-        &state.rpc_path, &bind_addr
-    );
-
-    server.await.context("serving requests")?;
-
-    Ok(())
 }
