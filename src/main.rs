@@ -1,5 +1,4 @@
 use anyhow::{anyhow, Context, Result};
-use cln_grpc::pb::node_server::NodeServer;
 use cln_plugin::{options, Builder};
 use cln_rpc::model::ListinvoicesInvoices;
 use log::{debug, info, warn};
@@ -9,9 +8,14 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::plugin::plugin_server::PluginServer;
+
 mod config;
-mod state;
 mod hooks;
+pub mod plugin {
+    tonic::include_proto!("cln");
+}
+mod state;
 mod tasks;
 mod tls;
 mod util;
@@ -106,24 +110,24 @@ async fn main() -> Result<()> {
                     Err(e) => warn!("Error in clean_up thread: {}", e.to_string()),
                 };
             });
+
+            let bind_addr: SocketAddr = format!("0.0.0.0:{}", bind_port).parse().unwrap();
+
+            tokio::select! {
+                _ = confplugin.join() => {
+                // This will likely never be shown, if we got here our
+                // parent process is exiting and not processing out log
+                // messages anymore.
+                    debug!("Plugin loop terminated")
+                }
+                e = run_interface(bind_addr, state) => {
+                    warn!("Error running grpc interface: {:?}", e)
+                }
+            }
+            Ok(())
         }
         Err(e) => return Err(anyhow!("Error starting plugin: {}", e)),
     }
-
-    let bind_addr: SocketAddr = format!("0.0.0.0:{}", bind_port).parse().unwrap();
-
-    tokio::select! {
-        _ = confplugin.join() => {
-        // This will likely never be shown, if we got here our
-        // parent process is exiting and not processing out log
-        // messages anymore.
-            debug!("Plugin loop terminated")
-        }
-        e = run_interface(bind_addr, state) => {
-            warn!("Error running grpc interface: {:?}", e)
-        }
-    }
-    Ok(())
 }
 
 async fn run_interface(bind_addr: SocketAddr, state: PluginState) -> Result<()> {
@@ -134,14 +138,12 @@ async fn run_interface(bind_addr: SocketAddr, state: PluginState) -> Result<()> 
         .identity(identity)
         .client_ca_root(ca_cert);
 
+    let p = plugin::Server::default();
+
     let server = tonic::transport::Server::builder()
         .tls_config(tls)
         .context("configuring tls")?
-        .add_service(NodeServer::new(
-            cln_grpc::Server::new(&state.rpc_path)
-                .await
-                .context("creating NodeServer instance")?,
-        ))
+        .add_service(PluginServer::new(p))
         .serve(bind_addr);
 
     debug!(

@@ -19,6 +19,8 @@ parking_lot = "0.12"
 rcgen = { version = "0.10", features = ["pem", "x509-parser"] }
 rand = "0.8"
 prost = "0.11"
+hex = "0.4.3"
+lightning-invoice = "0.22"
 
 [dependencies.tokio]
 features = ["fs","net", "rt-multi-thread"]
@@ -27,3 +29,6 @@ version = "1"
 [dependencies.tonic]
 features = ["tls", "transport"]
 version = "0.8"
+
+[build-dependencies]
+tonic-build = "0.8"
