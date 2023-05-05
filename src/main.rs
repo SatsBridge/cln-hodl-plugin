@@ -8,17 +8,17 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::plugin::plugin_server::PluginServer;
+//use cln_grpc::pb::node_server::NodeServer;
 
 mod config;
 mod hooks;
-pub mod plugin {
-    tonic::include_proto!("cln");
-}
+pub mod plugin;
 mod state;
 mod tasks;
 mod tls;
 mod util;
+
+pub use crate::plugin::PluginServer;
 
 #[derive(Clone, Debug, Copy)]
 pub struct HodlUpdate {
@@ -138,12 +138,14 @@ async fn run_interface(bind_addr: SocketAddr, state: PluginState) -> Result<()> 
         .identity(identity)
         .client_ca_root(ca_cert);
 
-    let p = plugin::Server::default();
-
     let server = tonic::transport::Server::builder()
         .tls_config(tls)
         .context("configuring tls")?
-        .add_service(PluginServer::new(p))
+        .add_service(PluginServer::new(
+            cln_grpc::Server::new(&state.rpc_path)
+                .await
+                .context("creating NodeServer instance")?,
+        ))
         .serve(bind_addr);
 
     debug!(

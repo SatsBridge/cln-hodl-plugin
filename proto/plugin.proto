@@ -7,10 +7,10 @@ package cln;
 
 service Plugin {
     rpc Ping (PluginPingRequest) returns (PluginPongReply);
-	rpc HodlInvoice(HodlInvoiceRequest) returns (HodlInvoiceResponse) {}
-	rpc HodlInvoiceSettle(HodlInvoiceSettleRequest) returns (HodlInvoiceSettleResponse) {}
-	rpc HodlInvoiceCancel(HodlInvoiceCancelRequest) returns (HodlInvoiceCancelResponse) {}
-	rpc HodlInvoiceLookup(HodlInvoiceLookupRequest) returns (HodlInvoiceLookupResponse) {}
+		rpc HodlInvoice(HodlInvoiceRequest) returns (HodlInvoiceResponse) {}
+		rpc HodlInvoiceSettle(HodlInvoiceSettleRequest) returns (HodlInvoiceSettleResponse) {}
+		rpc HodlInvoiceCancel(HodlInvoiceCancelRequest) returns (HodlInvoiceCancelResponse) {}
+		rpc HodlInvoiceLookup(HodlInvoiceLookupRequest) returns (HodlInvoiceLookupResponse) {}
 }
 
 message PluginPingRequest {

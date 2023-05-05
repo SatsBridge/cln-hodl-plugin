@@ -1,7 +1,10 @@
-use crate::{plugin, state::{
+tonic::include_proto!("cln");
+use plugin::plugin_server::{Plugin, PluginServer};
+
+use crate::state::{
     datastore_new_state, datastore_update_state_forced, listdatastore_htlc_expiry,
     listdatastore_state, short_channel_id_to_string, HodlState,
-}};
+};
 
 use anyhow::Result;
 use cln_rpc::{ClnRpc, model, Request, Response};
@@ -14,6 +17,7 @@ use cln_grpc::pb;
 use cln_rpc::model::{InvoiceResponse, requests};
 use cln_rpc::primitives::{Amount, AmountOrAny};
 use tonic::{Code, Status};
+
 
 #[derive(Clone)]
 pub struct Server {
@@ -32,15 +36,15 @@ impl Server {
 impl Plugin for Server {
     async fn ping(
         &self,
-        request: Request<PluginPingRequest>, // Accept request of type HelloRequest
-    ) -> Result<Response<PluginPongReply>, Status> { // Return an instance of type HelloReply
-        info!("Got a request: {:?}", request);
+        request: tonic::Request<PluginPingRequest>, // Accept request of type HelloRequest
+    ) -> Result<tonic::Response<PluginPongReply>, Status> { // Return an instance of type HelloReply
+        debug!("Got a request: {:?}", request);
 
-        let reply = hello_world::HelloReply {
-            message: format!("Hello {}!", request.into_inner().name).into(), // We must use .into_inner() as the fields of gRPC requests and responses are private
+        let reply = PluginPongReply {
+            message: format!("Hello {}!", request.into_inner().message).into(), // We must use .into_inner() as the fields of gRPC requests and responses are private
         };
 
-        Ok(Response::new(reply)) // Send back our formatted greeting
+        Ok(tonic::Response::new(reply)) // Send back our formatted greeting
     }
 
     async fn hodl_invoice(
