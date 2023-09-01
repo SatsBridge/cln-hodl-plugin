@@ -1,37 +1,32 @@
 use anyhow::{anyhow, Context, Result};
+use cln_hodl_grpc::pb::hodl_server::HodlServer;
+use cln_hodl_grpc::Hodlstate;
 use cln_plugin::{options, Builder};
 use cln_rpc::model::ListinvoicesInvoices;
 use log::{debug, info, warn};
 use parking_lot::Mutex;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-//use cln_grpc::pb::node_server::NodeServer;
-
-mod config;
 mod hooks;
-pub mod plugin;
-mod state;
 mod tasks;
 mod tls;
 mod util;
 
-pub use crate::plugin::PluginServer;
-
-#[derive(Clone, Debug, Copy)]
-pub struct HodlUpdate {
-    pub state: state::HodlState,
+#[derive(Clone, Debug)]
+pub struct HodlInvoice {
+    pub hodl_state: Hodlstate,
     pub generation: u64,
+    pub htlc_amounts_msat: HashMap<String, u64>,
+    pub invoice: ListinvoicesInvoices,
 }
+
 #[derive(Clone, Debug)]
 pub struct PluginState {
-    pub config: Arc<Mutex<config::Config>>,
     pub blockheight: Arc<Mutex<u32>>,
-    pub invoice_amts: Arc<Mutex<BTreeMap<String, u64>>>,
-    pub states: Arc<tokio::sync::Mutex<BTreeMap<String, HodlUpdate>>>,
-    pub invoices: Arc<Mutex<BTreeMap<String, ListinvoicesInvoices>>>,
+    pub hodlinvoices: Arc<tokio::sync::Mutex<BTreeMap<String, HodlInvoice>>>,
     rpc_path: PathBuf,
     identity: tls::Identity,
     ca_cert: Vec<u8>,
@@ -39,7 +34,7 @@ pub struct PluginState {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    debug!("Starting grpc plugin");
+    debug!("Starting grpc-hodl plugin");
     std::env::set_var("CLN_PLUGIN_LOG", "debug");
     let path = Path::new("lightning-rpc");
 
@@ -47,11 +42,8 @@ async fn main() -> Result<()> {
     let (identity, ca_cert) = tls::init(&directory)?;
 
     let state = PluginState {
-        config: Arc::new(Mutex::new(config::Config::new())),
         blockheight: Arc::new(Mutex::new(u32::default())),
-        invoice_amts: Arc::new(Mutex::new(BTreeMap::new())),
-        states: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
-        invoices: Arc::new(Mutex::new(BTreeMap::new())),
+        hodlinvoices: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
         rpc_path: path.into(),
         identity,
         ca_cert,
@@ -69,11 +61,11 @@ async fn main() -> Result<()> {
         .await?
     {
         Some(p) => {
-            info!("read config");
-            match config::read_config(&p, state.clone()).await {
-                Ok(()) => &(),
-                Err(e) => return p.disable(format!("{}", e).as_str()).await,
-            };
+            // info!("read config");
+            // match config::read_config(&p, state.clone()).await {
+            //     Ok(()) => &(),
+            //     Err(e) => return p.disable(format!("{}", e).as_str()).await,
+            // };
             p
         }
         None => return Ok(()),
@@ -110,24 +102,24 @@ async fn main() -> Result<()> {
                     Err(e) => warn!("Error in clean_up thread: {}", e.to_string()),
                 };
             });
-
-            let bind_addr: SocketAddr = format!("0.0.0.0:{}", bind_port).parse().unwrap();
-
-            tokio::select! {
-                _ = confplugin.join() => {
-                // This will likely never be shown, if we got here our
-                // parent process is exiting and not processing out log
-                // messages anymore.
-                    debug!("Plugin loop terminated")
-                }
-                e = run_interface(bind_addr, state) => {
-                    warn!("Error running grpc interface: {:?}", e)
-                }
-            }
-            Ok(())
         }
         Err(e) => return Err(anyhow!("Error starting plugin: {}", e)),
     }
+
+    let bind_addr: SocketAddr = format!("0.0.0.0:{}", bind_port).parse().unwrap();
+
+    tokio::select! {
+        _ = confplugin.join() => {
+        // This will likely never be shown, if we got here our
+        // parent process is exiting and not processing out log
+        // messages anymore.
+            debug!("Plugin loop terminated")
+        }
+        e = run_interface(bind_addr, state) => {
+            warn!("Error running grpc interface: {:?}", e)
+        }
+    }
+    Ok(())
 }
 
 async fn run_interface(bind_addr: SocketAddr, state: PluginState) -> Result<()> {
@@ -141,8 +133,8 @@ async fn run_interface(bind_addr: SocketAddr, state: PluginState) -> Result<()> 
     let server = tonic::transport::Server::builder()
         .tls_config(tls)
         .context("configuring tls")?
-        .add_service(PluginServer::new(
-            cln_grpc::Server::new(&state.rpc_path)
+        .add_service(HodlServer::new(
+            cln_hodl_grpc::Server::new(&state.rpc_path)
                 .await
                 .context("creating NodeServer instance")?,
         ))

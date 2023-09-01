@@ -33,3 +33,20 @@ pub async fn listinvoices(
 pub fn make_rpc_path(plugin: &Plugin<PluginState>) -> PathBuf {
     Path::new(&plugin.configuration().lightning_dir).join(plugin.configuration().rpc_file)
 }
+
+pub async fn cleanup_htlc_state(
+    plugin: Plugin<PluginState>,
+    pay_hash: &str,
+    scid: &str,
+    htlc_id: u64,
+) {
+    let mut hodl_invoices = plugin.state().hodlinvoices.lock().await;
+    if let Some(h_inv) = hodl_invoices.get_mut(pay_hash) {
+        h_inv
+            .htlc_amounts_msat
+            .remove(&(scid.to_string() + &htlc_id.to_string()));
+        if h_inv.htlc_amounts_msat.is_empty() {
+            hodl_invoices.remove(pay_hash);
+        }
+    }
+}

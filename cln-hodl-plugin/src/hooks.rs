@@ -1,6 +1,12 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashMap,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{anyhow, Error};
+use cln_hodl_grpc::{
+    datastore_htlc_expiry, datastore_update_state, listdatastore_state, Hodlstate,
+};
 use cln_plugin::Plugin;
 use cln_rpc::primitives::Amount;
 use log::{debug, info, warn};
@@ -8,9 +14,8 @@ use serde_json::json;
 use tokio::time;
 
 use crate::{
-    HodlUpdate, PluginState,
-    state::{datastore_htlc_expiry, datastore_update_state, list_datastore_state, HodlState},
-    util::{listinvoices, make_rpc_path},
+    util::{cleanup_htlc_state, listinvoices, make_rpc_path},
+    HodlInvoice, PluginState,
 };
 
 pub(crate) async fn htlc_handler(
@@ -25,60 +30,50 @@ pub(crate) async fn htlc_handler(
             debug!("payment_hash: `{}`. htlc_hook started!", pay_hash);
             let rpc_path = make_rpc_path(&plugin);
 
-            let invoice;
-            let cltv_delta;
-            let cltv_expiry = match htlc.get("cltv_expiry") {
-                Some(ce) => ce.as_u64().unwrap() as u32,
-                None => {
-                    warn!(
-                        "payment_hash: `{}`. cltv_expiry not found! Rejecting htlc...",
-                        pay_hash
-                    );
-                    return Ok(json!({"result": "fail"}));
-                }
-            };
+            let is_new_invoice;
+            let cltv_expiry;
+
             let amount_msat;
+
+            let invoice;
             let scid;
             let htlc_id;
-            let HodlState;
+            let hodl_state;
+
             {
-                let mut states = plugin.state().states.lock().await;
-                match states.get(&pay_hash.to_string()) {
+                let mut states = plugin.state().hodlinvoices.lock().await;
+                let generation;
+                match states.get_mut(&pay_hash.to_string()) {
                     Some(h) => {
+                        is_new_invoice = false;
                         debug!(
                             "payment_hash: `{}`. Htlc is for a known hodl-invoice! Processing...",
                             pay_hash
                         );
-                        HodlState = h.state;
-                        invoice = plugin
-                            .state()
-                            .invoices
-                            .lock()
-                            .get(&pay_hash.to_string())
-                            .unwrap()
-                            .clone();
+
+                        hodl_state = h.hodl_state;
+                        invoice = h.invoice.clone();
+                        generation = h.generation;
                     }
                     None => {
+                        is_new_invoice = true;
                         debug!(
                             "payment_hash: `{}`. Htlc for fresh invoice arrived. Checking if it's a hodl-invoice...",
                             pay_hash
                         );
 
-                        match list_datastore_state(&rpc_path, pay_hash.to_string()).await {
-                            Ok(s) => {
+                        match listdatastore_state(&rpc_path, pay_hash.to_string()).await {
+                            Ok(dbstate) => {
                                 debug!(
                                     "payment_hash: `{}`. Htlc is indeed for a hodl-invoice! Processing...",
                                     pay_hash
                                 );
-                                HodlState = HodlState::from_str(&s.string.unwrap())?;
-                                let gen = if let Some(g) = s.generation { g } else { 0 };
-
-                                datastore_htlc_expiry(
-                                    &rpc_path,
-                                    pay_hash.to_string(),
-                                    cltv_expiry.to_string(),
-                                )
-                                .await?;
+                                hodl_state = Hodlstate::from_str(&dbstate.string.unwrap())?;
+                                generation = if let Some(g) = dbstate.generation {
+                                    g
+                                } else {
+                                    0
+                                };
 
                                 invoice = listinvoices(&rpc_path, None, Some(pay_hash.to_string()))
                                     .await?
@@ -89,19 +84,6 @@ pub(crate) async fn htlc_handler(
                                         pay_hash
                                     ))?
                                     .clone();
-                                plugin
-                                    .state()
-                                    .invoices
-                                    .lock()
-                                    .insert(pay_hash.to_string(), invoice.clone());
-
-                                states.insert(
-                                    pay_hash.to_string(),
-                                    HodlUpdate {
-                                        state: HodlState,
-                                        generation: gen,
-                                    },
-                                );
                             }
                             Err(_e) => {
                                 debug!(
@@ -113,63 +95,95 @@ pub(crate) async fn htlc_handler(
                         };
                     }
                 }
+
+                htlc_id = match htlc.get("id") {
+                    Some(ce) => ce.as_u64().unwrap(),
+                    None => {
+                        warn!(
+                            "payment_hash: `{}`. htlc id not found! Rejecting htlc...",
+                            pay_hash
+                        );
+                        return Ok(json!({"result": "fail"}));
+                    }
+                };
+
+                scid = match htlc.get("short_channel_id") {
+                    Some(ce) => ce.as_str().unwrap(),
+                    None => {
+                        warn!(
+                            "payment_hash: `{}`. short_channel_id not found! Rejecting htlc...",
+                            pay_hash
+                        );
+                        return Ok(json!({"result": "fail"}));
+                    }
+                };
+
+                cltv_expiry = match htlc.get("cltv_expiry") {
+                    Some(ce) => ce.as_u64().unwrap() as u32,
+                    None => {
+                        warn!(
+                            "payment_hash: `{}`. cltv_expiry not found! Rejecting htlc...",
+                            pay_hash
+                        );
+                        return Ok(json!({"result": "fail"}));
+                    }
+                };
+
+                amount_msat = match htlc.get("amount_msat") {
+                    Some(ce) => ce.as_u64().unwrap(),
+                    None => {
+                        warn!(
+                            "payment_hash: `{}` scid: `{}` htlc_id: {}: amount_msat not found! Rejecting htlc...",
+                            pay_hash, scid, htlc_id
+                        );
+                        return Ok(json!({"result": "fail"}));
+                    }
+                };
+
+                if is_new_invoice {
+                    datastore_htlc_expiry(&rpc_path, pay_hash.to_string(), cltv_expiry.to_string())
+                        .await?;
+
+                    let mut amounts_msat = HashMap::new();
+                    amounts_msat.insert(scid.to_string() + &htlc_id.to_string(), amount_msat);
+                    states.insert(
+                        pay_hash.to_string(),
+                        HodlInvoice {
+                            hodl_state,
+                            generation,
+                            htlc_amounts_msat: amounts_msat,
+                            invoice: invoice.clone(),
+                        },
+                    );
+                } else {
+                    states
+                        .get_mut(&pay_hash.to_string())
+                        .unwrap()
+                        .htlc_amounts_msat
+                        .insert(scid.to_string() + &htlc_id.to_string(), amount_msat);
+                }
             }
-            debug!("payment_hash: `{}`. Init lock dropped", pay_hash);
-            match HodlState {
-                HodlState::Canceled => {
-                    info!(
+            match v.get("onion").unwrap().get("shared_secret") {
+                Some(ce) => debug!("{}", ce.as_str().unwrap()),
+                None => {
+                    warn!(
+                        "payment_hash: `{}`. shared_secret not found! Rejecting htlc...",
+                        pay_hash
+                    );
+                }
+            };
+
+            if let Hodlstate::Canceled = hodl_state {
+                info!(
                         "payment_hash: `{}`. Htlc arrived after hodl-cancellation was requested. Rejecting htlc...",
                         pay_hash
                     );
-                    return Ok(json!({"result": "fail"}));
-                }
-                _ => (),
-            }
-            htlc_id = match htlc.get("id") {
-                Some(ce) => ce.as_u64().unwrap(),
-                None => {
-                    warn!(
-                        "payment_hash: `{}`. htlc id not found! Rejecting htlc...",
-                        pay_hash
-                    );
-                    return Ok(json!({"result": "fail"}));
-                }
-            };
-            scid = match htlc.get("short_channel_id") {
-                Some(ce) => ce.as_str().unwrap(),
-                None => {
-                    warn!(
-                        "payment_hash: `{}`. short_channel_id not found! Rejecting htlc...",
-                        pay_hash
-                    );
-                    return Ok(json!({"result": "fail"}));
-                }
-            };
-            cltv_delta = plugin.state().config.lock().clone().cltv_delta.1 as u32;
 
-            amount_msat = match htlc.get("amount_msat") {
-                Some(ce) =>
-                // Amount::msat(&serde_json::from_str::<Amount>(ce).unwrap()), bugging trailing characters error
-                {
-                    let amt_str = ce.as_str().unwrap();
-                    amt_str[..amt_str.len() - 4].parse::<u64>().unwrap()
-                }
-                None => {
-                    warn!(
-                        "payment_hash: `{}` scid: `{}` htlc_id: {}: amount_msat not found! Rejecting htlc...",
-                        pay_hash, scid, htlc_id
-                    );
-                    return Ok(json!({"result": "fail"}));
-                }
-            };
-            {
-                let mut invoice_amts = plugin.state().invoice_amts.lock();
-                if let Some(amt) = invoice_amts.get_mut(&pay_hash.to_string()) {
-                    *amt += amount_msat;
-                } else {
-                    invoice_amts.insert(pay_hash.to_string(), amount_msat);
-                }
+                cleanup_htlc_state(plugin.clone(), pay_hash, scid, htlc_id).await;
+
+                return Ok(json!({"result": "fail"}));
             }
+
             info!(
                 "payment_hash: `{}` scid: `{}` htlc_id: `{}`. Holding {}msat",
                 pay_hash,
@@ -180,19 +194,17 @@ pub(crate) async fn htlc_handler(
 
             loop {
                 {
-                    let states = plugin.state().states.lock().await.clone();
-                    match states.get(&pay_hash.to_string()) {
-                        Some(datastore) => {
-                            let HodlState = datastore.state;
-                            let generation = datastore.generation;
+                    let hodl_invoice = plugin.state().hodlinvoices.lock().await.clone();
+                    match hodl_invoice.get(&pay_hash.to_string()) {
+                        Some(hodl_invoice_data) => {
+                            let hodlstate = hodl_invoice_data.hodl_state;
+                            let generation = hodl_invoice_data.generation;
                             let now = SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
                                 .unwrap()
                                 .as_secs();
 
-                            if invoice.expires_at <= now + 60
-                                && HodlState.is_valid_transition(&HodlState::Canceled)
-                            {
+                            if invoice.expires_at <= now + 60 {
                                 warn!(
                                     "payment_hash: `{}` scid: `{}` htlc: `{}`. Hodl-invoice expired! State=CANCELED",
                                     pay_hash, scid, htlc_id
@@ -200,7 +212,7 @@ pub(crate) async fn htlc_handler(
                                 match datastore_update_state(
                                     &rpc_path,
                                     pay_hash.to_string(),
-                                    HodlState::Canceled.to_string(),
+                                    Hodlstate::Canceled.to_string(),
                                     generation,
                                 )
                                 .await
@@ -211,33 +223,27 @@ pub(crate) async fn htlc_handler(
                                         continue;
                                     }
                                 };
-                                *plugin
-                                    .state()
-                                    .invoice_amts
-                                    .lock()
-                                    .get_mut(&pay_hash.to_string())
-                                    .unwrap() -= amount_msat;
+
+                                cleanup_htlc_state(plugin.clone(), pay_hash, scid, htlc_id).await;
+
                                 return Ok(json!({"result": "fail"}));
                             }
 
-                            if cltv_expiry
-                                <= plugin.state().blockheight.lock().clone() + cltv_delta + 6
-                                && HodlState.is_valid_transition(&HodlState::Open)
-                            {
+                            if cltv_expiry <= plugin.state().blockheight.lock().clone() + 6 {
                                 warn!(
                                     "payment_hash: `{}` scid: `{}` htlc: `{}`. HTLC timed out. Rejecting htlc...",
                                     pay_hash, scid, htlc_id
                                 );
-                                let invoice_amts = plugin.state().invoice_amts.lock().clone();
-                                let cur_amt = invoice_amts.get(&pay_hash.to_string()).unwrap();
+                                let cur_amt: u64 =
+                                    hodl_invoice_data.htlc_amounts_msat.values().sum();
                                 if Amount::msat(&invoice.amount_msat.unwrap())
                                     > cur_amt - amount_msat
-                                    && HodlState == HodlState::Accepted
+                                    && hodlstate == Hodlstate::Accepted
                                 {
                                     match datastore_update_state(
                                         &rpc_path,
                                         pay_hash.to_string(),
-                                        HodlState::Open.to_string(),
+                                        Hodlstate::Open.to_string(),
                                         generation,
                                     )
                                     .await
@@ -253,30 +259,22 @@ pub(crate) async fn htlc_handler(
                                         pay_hash, scid, htlc_id
                                     );
                                 }
-                                *plugin
-                                    .state()
-                                    .invoice_amts
-                                    .lock()
-                                    .get_mut(&pay_hash.to_string())
-                                    .unwrap() -= amount_msat;
+
+                                cleanup_htlc_state(plugin.clone(), pay_hash, scid, htlc_id).await;
+
                                 return Ok(json!({"result": "fail"}));
                             }
 
-                            match HodlState {
-                                HodlState::Open => {
+                            match hodlstate {
+                                Hodlstate::Open => {
                                     if Amount::msat(&invoice.amount_msat.unwrap())
-                                        <= *plugin
-                                            .state()
-                                            .invoice_amts
-                                            .lock()
-                                            .get(&pay_hash.to_string())
-                                            .unwrap()
-                                        && HodlState.is_valid_transition(&HodlState::Accepted)
+                                        <= hodl_invoice_data.htlc_amounts_msat.values().sum()
+                                        && hodlstate.is_valid_transition(&Hodlstate::Accepted)
                                     {
                                         match datastore_update_state(
                                             &rpc_path,
                                             pay_hash.to_string(),
-                                            HodlState::Accepted.to_string(),
+                                            Hodlstate::Accepted.to_string(),
                                             generation,
                                         )
                                         .await
@@ -298,20 +296,15 @@ pub(crate) async fn htlc_handler(
                                         );
                                     }
                                 }
-                                HodlState::Accepted => {
+                                Hodlstate::Accepted => {
                                     if Amount::msat(&invoice.amount_msat.unwrap())
-                                        > *plugin
-                                            .state()
-                                            .invoice_amts
-                                            .lock()
-                                            .get(&pay_hash.to_string())
-                                            .unwrap()
-                                        && HodlState.is_valid_transition(&HodlState::Open)
+                                        > hodl_invoice_data.htlc_amounts_msat.values().sum()
+                                        && hodlstate.is_valid_transition(&Hodlstate::Open)
                                     {
                                         match datastore_update_state(
                                             &rpc_path,
                                             pay_hash.to_string(),
-                                            HodlState::Open.to_string(),
+                                            Hodlstate::Open.to_string(),
                                             generation,
                                         )
                                         .await
@@ -333,18 +326,26 @@ pub(crate) async fn htlc_handler(
                                         );
                                     }
                                 }
-                                HodlState::Settled => {
+                                Hodlstate::Settled => {
                                     info!(
                                         "payment_hash: `{}` scid: `{}` htlc: `{}`. Settling htlc for hodl-invoice. State=SETTLED",
                                         pay_hash, scid, htlc_id
                                     );
+
+                                    cleanup_htlc_state(plugin.clone(), pay_hash, scid, htlc_id)
+                                        .await;
+
                                     return Ok(json!({"result": "continue"}));
                                 }
-                                HodlState::Canceled => {
+                                Hodlstate::Canceled => {
                                     info!(
                                         "payment_hash: `{}` scid: `{}` htlc: `{}`. Rejecting htlc for canceled hodl-invoice.  State=CANCELED",
                                         pay_hash, scid, htlc_id
                                     );
+
+                                    cleanup_htlc_state(plugin.clone(), pay_hash, scid, htlc_id)
+                                        .await;
+
                                     return Ok(json!({"result": "fail"}));
                                 }
                             }
