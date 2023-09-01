@@ -1,13 +1,11 @@
-// Huge json!() macros require lots of recursion
-#![recursion_limit = "1024"]
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
-mod convert;
-pub mod pb;
-mod server;
-
-use std::{fmt, path::PathBuf};
-
-use anyhow::{anyhow, Error};
+use anyhow::anyhow;
+use cln_plugin::{Error, Plugin};
+use cln_rpc::model::{
+    ListinvoicesRequest, ListinvoicesResponse, ListpeerchannelsRequest, ListpeerchannelsResponse,
+};
 use cln_rpc::{
     model::{
         DatastoreMode, DatastoreRequest, DatastoreResponse, DeldatastoreRequest,
@@ -15,75 +13,65 @@ use cln_rpc::{
     },
     ClnRpc, Request, Response,
 };
+
+const HOLD_INVOICE_PLUGIN_NAME: &str = "holdinvoice";
+const HOLD_INVOICE_DATASTORE_STATE: &str = "state";
+const HOLD_INVOICE_DATASTORE_HTLC_EXPIRY: &str = "expiry";
+pub const CANCEL_HOLD_BEFORE_INVOICE_EXPIRY_SECONDS: u64 = 1_800;
+pub const CANCEL_HOLD_BEFORE_HTLC_EXPIRY_BLOCKS: u32 = 6;
+
 use log::debug;
 
-pub use crate::server::Server;
+use crate::model::{HoldInvoice, HtlcIdentifier, PluginState};
 
-pub const HODLVOICE_PLUGIN_NAME: &str = "hodlvoice";
-const HODLVOICE_DATASTORE_STATE: &str = "state";
-const HODLVOICE_DATASTORE_HTLC_EXPIRY: &str = "expiry";
-
-#[cfg(test)]
-mod test;
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum Hodlstate {
-    Open,
-    Settled,
-    Canceled,
-    Accepted,
-}
-impl Hodlstate {
-    pub fn to_string(&self) -> String {
-        match self {
-            Hodlstate::Open => "open".to_string(),
-            Hodlstate::Settled => "settled".to_string(),
-            Hodlstate::Canceled => "canceled".to_string(),
-            Hodlstate::Accepted => "accepted".to_string(),
-        }
-    }
-    pub fn from_str(s: &str) -> Result<Hodlstate, Error> {
-        match s.to_lowercase().as_str() {
-            "open" => Ok(Hodlstate::Open),
-            "settled" => Ok(Hodlstate::Settled),
-            "canceled" => Ok(Hodlstate::Canceled),
-            "accepted" => Ok(Hodlstate::Accepted),
-            _ => Err(anyhow!("could not parse Hodlstate from string")),
-        }
-    }
-    pub fn as_i32(&self) -> i32 {
-        match self {
-            Hodlstate::Open => 0,
-            Hodlstate::Settled => 1,
-            Hodlstate::Canceled => 2,
-            Hodlstate::Accepted => 3,
-        }
-    }
-    pub fn is_valid_transition(&self, newstate: &Hodlstate) -> bool {
-        match self {
-            Hodlstate::Open => match newstate {
-                Hodlstate::Settled => false,
-                _ => true,
-            },
-            Hodlstate::Settled => match newstate {
-                Hodlstate::Settled => true,
-                _ => false,
-            },
-            Hodlstate::Canceled => match newstate {
-                Hodlstate::Canceled => true,
-                _ => false,
-            },
-            Hodlstate::Accepted => true,
-        }
+pub async fn listinvoices(
+    rpc_path: &PathBuf,
+    label: Option<String>,
+    payment_hash: Option<String>,
+) -> Result<ListinvoicesResponse, Error> {
+    let mut rpc = ClnRpc::new(&rpc_path).await?;
+    let invoice_request = rpc
+        .call(Request::ListInvoices(ListinvoicesRequest {
+            label,
+            invstring: None,
+            payment_hash,
+            offer_id: None,
+        }))
+        .await
+        .map_err(|e| anyhow!("Error calling listinvoices: {:?}", e))?;
+    match invoice_request {
+        Response::ListInvoices(info) => Ok(info),
+        e => Err(anyhow!("Unexpected result in listinvoices: {:?}", e)),
     }
 }
-impl fmt::Display for Hodlstate {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Hodlstate::Open => write!(f, "open"),
-            Hodlstate::Settled => write!(f, "settled"),
-            Hodlstate::Canceled => write!(f, "canceled"),
-            Hodlstate::Accepted => write!(f, "accepted"),
+
+pub async fn listpeerchannels(rpc_path: &PathBuf) -> Result<ListpeerchannelsResponse, Error> {
+    let mut rpc = ClnRpc::new(&rpc_path).await?;
+    let list_peer_channels = rpc
+        .call(Request::ListPeerChannels(ListpeerchannelsRequest {
+            id: None,
+        }))
+        .await
+        .map_err(|e| anyhow!("Error calling listpeerchannels: {}", e.to_string()))?;
+    match list_peer_channels {
+        Response::ListPeerChannels(info) => Ok(info),
+        e => Err(anyhow!("Unexpected result in listpeerchannels: {:?}", e)),
+    }
+}
+
+pub fn make_rpc_path(plugin: Plugin<PluginState>) -> PathBuf {
+    Path::new(&plugin.configuration().lightning_dir).join(plugin.configuration().rpc_file)
+}
+
+pub async fn cleanup_pluginstate_holdinvoices(
+    hold_invoices: &mut BTreeMap<String, HoldInvoice>,
+    pay_hash: &str,
+    global_htlc_ident: &HtlcIdentifier,
+) {
+    if let Some(h_inv) = hold_invoices.get_mut(pay_hash) {
+        h_inv.htlc_data.remove(global_htlc_ident);
+        if h_inv.htlc_data.is_empty() {
+            hold_invoices.remove(pay_hash);
         }
     }
 }
@@ -114,7 +102,7 @@ async fn datastore_raw(
     }
 }
 
-async fn datastore_new_state(
+pub async fn datastore_new_state(
     rpc_path: &PathBuf,
     pay_hash: String,
     string: String,
@@ -122,9 +110,9 @@ async fn datastore_new_state(
     datastore_raw(
         rpc_path,
         vec![
-            HODLVOICE_PLUGIN_NAME.to_string(),
+            HOLD_INVOICE_PLUGIN_NAME.to_string(),
             pay_hash,
-            HODLVOICE_DATASTORE_STATE.to_string(),
+            HOLD_INVOICE_DATASTORE_STATE.to_string(),
         ],
         Some(string),
         None,
@@ -143,9 +131,9 @@ pub async fn datastore_update_state(
     datastore_raw(
         rpc_path,
         vec![
-            HODLVOICE_PLUGIN_NAME.to_string(),
+            HOLD_INVOICE_PLUGIN_NAME.to_string(),
             pay_hash,
-            HODLVOICE_DATASTORE_STATE.to_string(),
+            HOLD_INVOICE_DATASTORE_STATE.to_string(),
         ],
         Some(string),
         None,
@@ -155,7 +143,7 @@ pub async fn datastore_update_state(
     .await
 }
 
-async fn datastore_update_state_forced(
+pub async fn datastore_update_state_forced(
     rpc_path: &PathBuf,
     pay_hash: String,
     string: String,
@@ -163,9 +151,9 @@ async fn datastore_update_state_forced(
     datastore_raw(
         rpc_path,
         vec![
-            HODLVOICE_PLUGIN_NAME.to_string(),
+            HOLD_INVOICE_PLUGIN_NAME.to_string(),
             pay_hash,
-            HODLVOICE_DATASTORE_STATE.to_string(),
+            HOLD_INVOICE_DATASTORE_STATE.to_string(),
         ],
         Some(string),
         None,
@@ -183,9 +171,9 @@ pub async fn datastore_htlc_expiry(
     datastore_raw(
         rpc_path,
         vec![
-            HODLVOICE_PLUGIN_NAME.to_string(),
+            HOLD_INVOICE_PLUGIN_NAME.to_string(),
             pay_hash,
-            HODLVOICE_DATASTORE_HTLC_EXPIRY.to_string(),
+            HOLD_INVOICE_DATASTORE_HTLC_EXPIRY.to_string(),
         ],
         Some(string),
         None,
@@ -194,26 +182,6 @@ pub async fn datastore_htlc_expiry(
     )
     .await
 }
-
-// pub async fn datastore_update_htlc_expiry(
-//     rpc_path: &PathBuf,
-//     pay_hash: String,
-//     string: String,
-// ) -> Result<DatastoreResponse, Error> {
-//     datastore_raw(
-//         rpc_path,
-//         vec![
-//             HODLVOICE_PLUGIN_NAME.to_string(),
-//             pay_hash,
-//             HODLVOICE_DATASTORE_HTLC_EXPIRY.to_string(),
-//         ],
-//         Some(string),
-//         None,
-//         Some(DatastoreMode::MUST_REPLACE),
-//         None,
-//     )
-//     .await
-// }
 
 async fn listdatastore_raw(
     rpc_path: &PathBuf,
@@ -231,7 +199,7 @@ async fn listdatastore_raw(
 }
 
 pub async fn listdatastore_all(rpc_path: &PathBuf) -> Result<ListdatastoreResponse, Error> {
-    listdatastore_raw(rpc_path, Some(vec![HODLVOICE_PLUGIN_NAME.to_string()])).await
+    listdatastore_raw(rpc_path, Some(vec![HOLD_INVOICE_PLUGIN_NAME.to_string()])).await
 }
 
 pub async fn listdatastore_state(
@@ -241,9 +209,9 @@ pub async fn listdatastore_state(
     let response = listdatastore_raw(
         rpc_path,
         Some(vec![
-            HODLVOICE_PLUGIN_NAME.to_string(),
+            HOLD_INVOICE_PLUGIN_NAME.to_string(),
             pay_hash.clone(),
-            HODLVOICE_DATASTORE_STATE.to_string(),
+            HOLD_INVOICE_DATASTORE_STATE.to_string(),
         ]),
     )
     .await?;
@@ -260,9 +228,9 @@ pub async fn listdatastore_htlc_expiry(rpc_path: &PathBuf, pay_hash: String) -> 
     let response = listdatastore_raw(
         rpc_path,
         Some(vec![
-            HODLVOICE_PLUGIN_NAME.to_string(),
+            HOLD_INVOICE_PLUGIN_NAME.to_string(),
             pay_hash.clone(),
-            HODLVOICE_DATASTORE_HTLC_EXPIRY.to_string(),
+            HOLD_INVOICE_DATASTORE_HTLC_EXPIRY.to_string(),
         ]),
     )
     .await?;
@@ -312,9 +280,9 @@ pub async fn del_datastore_state(
     del_datastore_raw(
         rpc_path,
         vec![
-            HODLVOICE_PLUGIN_NAME.to_string(),
+            HOLD_INVOICE_PLUGIN_NAME.to_string(),
             pay_hash,
-            HODLVOICE_DATASTORE_STATE.to_string(),
+            HOLD_INVOICE_DATASTORE_STATE.to_string(),
         ],
     )
     .await
@@ -327,17 +295,10 @@ pub async fn del_datastore_htlc_expiry(
     del_datastore_raw(
         rpc_path,
         vec![
-            HODLVOICE_PLUGIN_NAME.to_string(),
+            HOLD_INVOICE_PLUGIN_NAME.to_string(),
             pay_hash.clone(),
-            HODLVOICE_DATASTORE_HTLC_EXPIRY.to_string(),
+            HOLD_INVOICE_DATASTORE_HTLC_EXPIRY.to_string(),
         ],
     )
     .await
-}
-
-fn short_channel_id_to_string(scid: u64) -> String {
-    let block_height = scid >> 40;
-    let tx_index = (scid >> 16) & 0xFFFFFF;
-    let output_index = scid & 0xFFFF;
-    format!("{}x{}x{}", block_height, tx_index, output_index)
 }
