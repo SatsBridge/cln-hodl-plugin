@@ -4,12 +4,8 @@ use anyhow::{anyhow, Error};
 use cln_plugin::Plugin;
 use cln_rpc::{
     model::{
-        requests::{
-            InvoiceRequest
-        },
-        responses::{
-            ListinvoicesInvoicesStatus
-        }
+        requests::InvoiceRequest,
+        responses::{ListinvoicesInvoicesStatus, ListpeerchannelsChannelsState},
     },
     primitives::{Amount, AmountOrAny},
     ClnRpc, Request, Response,
@@ -36,7 +32,7 @@ pub async fn hold_invoice(
     let rpc_path = make_rpc_path(plugin.clone());
     let mut rpc = ClnRpc::new(&rpc_path).await?;
 
-    let valid_arg_keys = vec![
+    let valid_arg_keys = [
         "amount_msat",
         "label",
         "description",
@@ -217,7 +213,27 @@ pub async fn hold_invoice_lookup(
 
     let mut htlc_expiry = None;
     match holdstate {
-        Holdstate::Open => (),
+        Holdstate::Open => {
+            let invoices = listinvoices(&rpc_path, None, Some(pay_hash.clone()))
+                .await?
+                .invoices;
+            if let Some(inv) = invoices.first() {
+                if inv.status == ListinvoicesInvoicesStatus::EXPIRED {
+                    datastore_update_state_forced(
+                        &rpc_path,
+                        pay_hash.clone(),
+                        Holdstate::Canceled.to_string(),
+                    )
+                    .await?;
+                    return Ok(json!(HoldLookupResponse {
+                        state: Holdstate::Canceled.to_string(),
+                        htlc_expiry
+                    }));
+                }
+            } else {
+                return Ok(payment_hash_missing_error(&pay_hash));
+            }
+        }
         Holdstate::Accepted => {
             htlc_expiry = Some(listdatastore_htlc_expiry(&rpc_path, pay_hash.clone()).await?)
         }
@@ -231,12 +247,32 @@ pub async fn hold_invoice_lookup(
                 };
 
                 for chan in channels {
-                    if let Some(htlcs) = chan.htlcs {
-                        for htlc in htlcs {
-                            if let Some(ph) = htlc.payment_hash {
-                                if ph.to_string() == pay_hash {
-                                    all_cancelled = false;
-                                }
+                    let connected = if let Some(c) = chan.peer_connected {
+                        c
+                    } else {
+                        continue;
+                    };
+                    let state = if let Some(s) = chan.state {
+                        s
+                    } else {
+                        continue;
+                    };
+                    if !connected
+                        || state != ListpeerchannelsChannelsState::CHANNELD_NORMAL
+                            && state != ListpeerchannelsChannelsState::CHANNELD_AWAITING_SPLICE
+                    {
+                        continue;
+                    }
+
+                    let htlcs = if let Some(h) = chan.htlcs {
+                        h
+                    } else {
+                        continue;
+                    };
+                    for htlc in htlcs {
+                        if let Some(ph) = htlc.payment_hash {
+                            if ph.to_string() == pay_hash {
+                                all_cancelled = false;
                             }
                         }
                     }
@@ -382,7 +418,7 @@ fn parse_payment_hash(args: serde_json::Value) -> Result<String, serde_json::Val
             ))
         }
     } else if let serde_json::Value::Object(o) = args {
-        let valid_arg_keys = vec!["payment_hash"];
+        let valid_arg_keys = ["payment_hash"];
         for (k, _v) in o.iter() {
             if !valid_arg_keys.contains(&k.as_str()) {
                 return Err(invalid_argument_error(k));

@@ -11,7 +11,7 @@ use cln_rpc::{
         },
         responses::{
             DatastoreResponse, DeldatastoreResponse, ListdatastoreDatastore, ListdatastoreResponse,
-            ListpeerchannelsResponse, ListinvoicesResponse
+            ListinvoicesResponse, ListpeerchannelsResponse,
         },
     },
     ClnRpc, Request, Response,
@@ -41,7 +41,7 @@ pub async fn listinvoices(
             offer_id: None,
             index: None,
             start: None,
-            limit: None
+            limit: None,
         }))
         .await
         .map_err(|e| anyhow!("Error calling listinvoices: {:?}", e))?;
